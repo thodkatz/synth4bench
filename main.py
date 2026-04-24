@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
-
 import logging
+from dataclasses import dataclass
+from typing import List
+
 import numpy as np
 import pandas as pd
+from sklearn.compose import ColumnTransformer
 from sklearn.metrics import (
     average_precision_score,
     confusion_matrix,
@@ -15,6 +17,9 @@ from sklearn.metrics import (
     roc_auc_score,
 )
 from sklearn.model_selection import StratifiedGroupKFold
+from sklearn.model_selection import StratifiedShuffleSplit
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder
 from xgboost import XGBClassifier
 
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
@@ -23,35 +28,55 @@ log = logging.getLogger("synth4bench")
 
 DATA_PATH = "/mnt/data/documents/certh/synth4bench/dataset.tsv"
 
-CALLERS = ("Freebayes", "LoFreq", "Mutect2", "VarDict", "VarScan")
-CALLER_VALUE_COLUMNS = ("DP", "AD", "AF", "AF Deviation")
-ID_COLUMNS = ("Dataset", "POS", "REF", "ALT")
-TRUTH_CLASSES = ("TP", "FN")
-EMITTED_CLASSES = ("TP", "FP")
+POSITIVE_CLASS = "TP"
+NEGATIVE_CLASS = "FP"
+EMITTED_CLASSES = (POSITIVE_CLASS, NEGATIVE_CLASS)
 
-
-@dataclass(frozen=True)
-class DatasetBundle:
+@dataclass
+class FilteredDataset:
     X: pd.DataFrame
     y: pd.Series
     groups: pd.Series
-    candidate_ids: pd.Series
+    numerical_features: List[str]
+    categorical_features: List[str]
+
+def preprocess_dataset(records: pd.DataFrame) -> FilteredDataset:
+    categorical_features = ["Caller"]
+    numeric_features = [
+        "Coverage",
+        "Read_length",
+        "DP",
+        "AF",
+        "ref_len",
+        "alt_len",
+        "indel_len",
+        "is_ref_eq_alt",
+        "variant_type_code",
+        "snp_substitution_code",
+    ]
+    numeric_features = [c for c in numeric_features if c in records.columns]
+
+    X = records[categorical_features + numeric_features]
+    y = records["label"].astype(int)
+    groups = records["mutation_group"].astype(str)
+    return FilteredDataset(X, y, groups, numeric_features, categorical_features)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Train a candidate-level XGBoost proof-of-concept ensemble."
+        description="Train a per-record XGBoost credibility classifier (TP vs FP) on emitted calls."
     )
     parser.add_argument("--data-path", default=DATA_PATH)
-    parser.add_argument("--folds", type=int, default=5)
+    parser.add_argument("--folds", type=int, default=1) # should be >=1
     parser.add_argument("--sample-rows", type=int, default=None)
-    parser.add_argument("--include-unemitted-truth", action="store_true")
     parser.add_argument("--random-state", type=int, default=7)
     parser.add_argument("--n-estimators", type=int, default=300)
     return parser.parse_args()
 
 
 def is_transition(ref: str, alt: str) -> bool:
+    ref = str(ref).upper()
+    alt = str(alt).upper()
     return {ref, alt} in ({"A", "G"}, {"C", "T"})
 
 
@@ -69,7 +94,6 @@ def add_variant_features(frame: pd.DataFrame) -> pd.DataFrame:
     is_insertion = out["indel_len"] > 0
     is_deletion = out["indel_len"] < 0
 
-    # Group feature 1: SNP vs insertion vs deletion vs other.
     # 0=other (including REF==ALT), 1=SNP, 2=INS, 3=DEL
     out["variant_type_code"] = np.select(
         [is_snp, is_insertion, is_deletion],
@@ -77,7 +101,6 @@ def add_variant_features(frame: pd.DataFrame) -> pd.DataFrame:
         default=0,
     ).astype(int)
 
-    # Group feature 2 (SNP-only): transition vs transversion vs NA.
     # 0=NA (non-SNP), 1=transition, 2=transversion
     is_ti = np.array(
         [
@@ -92,15 +115,14 @@ def add_variant_features(frame: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def flatten_columns(columns: pd.MultiIndex) -> list[str]:
-    return [f"{caller}_{feature}" for feature, caller in columns]
+def build_emitted_record_table(data_path: str, sample_rows: int | None = None) -> pd.DataFrame:
+    """
+    Builds a per-record training table aligned with inference-time inputs:
+    one row corresponds to one emitted VCF record from a given caller.
 
-
-def build_candidate_table(
-    data_path: str,
-    sample_rows: int | None = None,
-    include_unemitted_truth: bool = False,
-) -> DatasetBundle:
+    We train only on emitted calls: TP vs FP. FN/TN do not exist as records in the VCF,
+    and therefore aren't suitable for this per-record credibility model.
+    """
     usecols = [
         "Dataset",
         "Coverage",
@@ -109,9 +131,7 @@ def build_candidate_table(
         "REF",
         "ALT",
         "DP",
-        "AD",
         "AF",
-        "AF Deviation",
         "Caller",
         "Class",
     ]
@@ -123,145 +143,43 @@ def build_candidate_table(
         low_memory=False,
     )
 
-    raw["is_truth"] = raw["Class"].isin(TRUTH_CLASSES).astype(int)
-    raw["is_emitted"] = raw["Class"].isin(EMITTED_CLASSES).astype(int)
+    raw = raw.loc[raw["Class"].isin(EMITTED_CLASSES)].copy()
+    raw["label"] = (raw["Class"] == POSITIVE_CLASS).astype(int)
 
-    base = (
-        raw.groupby(list(ID_COLUMNS), dropna=False)
-        .agg(
-            Coverage=("Coverage", "first"),
-            Read_length=("Read_length", "first"),
-            label=("is_truth", "max"),
-            n_callers_supporting=("is_emitted", "sum"),
-        )
-        .reset_index()
+    raw = add_variant_features(raw)
+
+    # Used only for grouped CV leakage control, not as a feature.
+    raw["mutation_group"] = (
+        raw["POS"].astype(str) + ":" + raw["REF"].astype(str) + ">" + raw["ALT"].astype(str)
     )
 
-    emitted = raw.loc[raw["is_emitted"] == 1, [*ID_COLUMNS, "Caller", *CALLER_VALUE_COLUMNS]]
-    called_by = (
-        emitted.assign(called=1)
-        .pivot_table(
-            index=list(ID_COLUMNS),
-            columns="Caller",
-            values="called",
-            aggfunc="max",
-            fill_value=0,
-        )
-        .reindex(columns=CALLERS, fill_value=0)
-    )
-    called_by.columns = [f"called_by_{caller}" for caller in called_by.columns]
+    dp = raw["DP"]
+    af = raw["AF"]
 
-    caller_values = emitted.pivot_table(
-        index=list(ID_COLUMNS),
-        columns="Caller",
-        values=list(CALLER_VALUE_COLUMNS),
-        aggfunc="first",
-    )
-    caller_values = caller_values.reindex(
-        columns=pd.MultiIndex.from_product([CALLER_VALUE_COLUMNS, CALLERS])
-    )
-    caller_values.columns = flatten_columns(caller_values.columns)
-
-    candidates = (
-        base.set_index(list(ID_COLUMNS))
-        .join(called_by, how="left")
-        .join(caller_values, how="left")
-        .reset_index()
-    )
-
-    called_cols = [f"called_by_{caller}" for caller in CALLERS]
-    candidates[called_cols] = candidates[called_cols].fillna(0).astype(int)
-    candidates["n_callers_supporting"] = candidates[called_cols].sum(axis=1)
-
-    if not include_unemitted_truth:
-        candidates = candidates.loc[candidates["n_callers_supporting"] > 0].copy()
-
-    candidates = add_variant_features(candidates)
-    candidates["candidate_id"] = (
-        candidates["Dataset"].astype(str)
-        + ":"
-        + candidates["POS"].astype(str)
-        + ":"
-        + candidates["REF"].astype(str)
-        + ">"
-        + candidates["ALT"].astype(str)
-    )
-    candidates["mutation_group"] = (
-        candidates["POS"].astype(str)
-        + ":"
-        + candidates["REF"].astype(str)
-        + ">"
-        + candidates["ALT"].astype(str)
-    )
-
-    for caller in CALLERS:
-        called = candidates[f"called_by_{caller}"].astype(bool)
-        dp = candidates[f"{caller}_DP"]
-        ad_raw = candidates[f"{caller}_AD"]
-        af_raw = candidates[f"{caller}_AF"]
-
-        # Only impute within "called" rows. If a caller didn't emit the variant,
-        # we should not synthesize evidence for that caller.
-        ad_inferred = np.where(
-            called & ad_raw.isna() & dp.notna() & af_raw.notna() & (dp > 0),
-            af_raw * dp,
-            np.nan,
-        )
-        af_inferred = np.where(
-            called & af_raw.isna() & dp.notna() & ad_raw.notna() & (dp > 0),
-            ad_raw / dp,
-            np.nan,
-        )
-
-        ad_filled = ad_raw.fillna(pd.Series(ad_inferred, index=candidates.index))
-        af_filled = af_raw.fillna(pd.Series(af_inferred, index=candidates.index))
-
-        candidates[f"{caller}_AD_inferred"] = ad_inferred
-        candidates[f"{caller}_AF_inferred"] = af_inferred
-        candidates[f"{caller}_AD_filled"] = ad_filled
-        candidates[f"{caller}_AF_filled"] = af_filled
-        candidates[f"{caller}_AD_was_imputed"] = (
-            called & ad_raw.isna() & pd.notna(ad_inferred)
-        ).astype(int)
-        candidates[f"{caller}_AF_was_imputed"] = (
-            called & af_raw.isna() & pd.notna(af_inferred)
-        ).astype(int)
-
-        candidates[f"{caller}_AD_over_DP"] = ad_filled / dp.replace(0, np.nan)
-        candidates[f"{caller}_missing_AD"] = (called & ad_filled.isna()).astype(int)
-
-        dev_raw = candidates[f"{caller}_AF Deviation"]
-        candidates[f"{caller}_missing_AF_deviation"] = (called & dev_raw.isna()).astype(
-            int
-        )
-        candidates[f"{caller}_AF_deviation_filled"] = np.where(
-            called.to_numpy(),
-            dev_raw.fillna(0.0).to_numpy(),
-            np.nan,
-        )
-
-    excluded = {
-        *ID_COLUMNS,
-        "label",
-        "candidate_id",
-        "mutation_group",
-    }
-    feature_columns = [column for column in candidates.columns if column not in excluded]
-
-    return DatasetBundle(
-        X=candidates[feature_columns],
-        y=candidates["label"].astype(int),
-        groups=candidates["mutation_group"],
-        candidate_ids=candidates["candidate_id"],
-    )
+    raw["AF"] = af
+    return raw
 
 
-def make_model(y_train: pd.Series, random_state: int, n_estimators: int) -> XGBClassifier:
+def make_pipeline(
+    y_train: pd.Series,
+    numeric_features: list[str],
+    categorical_features: list[str],
+    random_state: int,
+    n_estimators: int,
+) -> Pipeline:
     positives = int(y_train.sum())
     negatives = int(len(y_train) - positives)
     scale_pos_weight = negatives / positives if positives else 1.0
 
-    return XGBClassifier(
+    pre = ColumnTransformer(
+        transformers=[
+            ("cat", OneHotEncoder(handle_unknown="ignore"), categorical_features),
+            ("num", "passthrough", numeric_features),
+        ],
+        remainder="drop",
+    )
+
+    model = XGBClassifier(
         objective="binary:logistic",
         eval_metric="logloss",
         tree_method="hist",
@@ -276,12 +194,12 @@ def make_model(y_train: pd.Series, random_state: int, n_estimators: int) -> XGBC
         random_state=random_state,
         n_jobs=-1,
     )
+    return Pipeline([("pre", pre), ("model", model)])
 
 
 def evaluate_fold(y_true: pd.Series, scores: np.ndarray) -> dict[str, float]:
     predictions = (scores >= 0.5).astype(int)
     tn, fp, fn, tp = confusion_matrix(y_true, predictions, labels=[0, 1]).ravel()
-
     return {
         "roc_auc": roc_auc_score(y_true, scores),
         "pr_auc": average_precision_score(y_true, scores),
@@ -295,7 +213,14 @@ def evaluate_fold(y_true: pd.Series, scores: np.ndarray) -> dict[str, float]:
     }
 
 
-def run_cross_validation(bundle: DatasetBundle, folds: int, random_state: int, n_estimators: int) -> pd.DataFrame:
+def run_cross_validation(records: pd.DataFrame, folds: int, random_state: int, n_estimators: int) -> pd.DataFrame:
+    dataset = preprocess_dataset(records)
+    groups = dataset.groups
+    X = dataset.X
+    y = dataset.y
+    numeric_features = dataset.numerical_features
+    categorical_features = dataset.categorical_features
+
     splitter = StratifiedGroupKFold(
         n_splits=folds,
         shuffle=True,
@@ -303,24 +228,30 @@ def run_cross_validation(bundle: DatasetBundle, folds: int, random_state: int, n
     )
     metrics = []
 
-    print(f"Candidates: {len(bundle.X):,}")
-    print(f"Features: {len(bundle.X.columns):,}")
-    print(f"Positive label rate: {bundle.y.mean():.4f}")
-    print(f"Groups for CV: {bundle.groups.nunique():,}")
+    print(f"Records: {len(X):,}")
+    print(f"Features: {len(categorical_features) + len(numeric_features):,}")
+    print(f"Positive label rate: {y.mean():.4f}")
+    print(f"Groups for CV: {groups.nunique():,}")
     print()
 
     for fold, (train_index, test_index) in enumerate(
-        splitter.split(bundle.X, bundle.y, groups=bundle.groups),
+        splitter.split(X, y, groups=groups),
         start=1,
     ):
-        X_train = bundle.X.iloc[train_index]
-        X_test = bundle.X.iloc[test_index]
-        y_train = bundle.y.iloc[train_index]
-        y_test = bundle.y.iloc[test_index]
+        X_train = X.iloc[train_index]
+        X_test = X.iloc[test_index]
+        y_train = y.iloc[train_index]
+        y_test = y.iloc[test_index]
 
-        model = make_model(y_train, random_state + fold, n_estimators)
-        model.fit(X_train, y_train)
-        scores = model.predict_proba(X_test)[:, 1]
+        pipeline = make_pipeline(
+            y_train=y_train,
+            numeric_features=numeric_features,
+            categorical_features=categorical_features,
+            random_state=random_state + fold,
+            n_estimators=n_estimators,
+        )
+        pipeline.fit(X_train, y_train)
+        scores = pipeline.predict_proba(X_test)[:, 1]
 
         fold_metrics = evaluate_fold(y_test, scores)
         fold_metrics["fold"] = float(fold)
@@ -338,29 +269,81 @@ def run_cross_validation(bundle: DatasetBundle, folds: int, random_state: int, n
     return pd.DataFrame(metrics)
 
 
+def run_single_split(records: pd.DataFrame, random_state: int, n_estimators: int, test_size: float = 0.2) -> dict[str, float]:
+    """
+    Single train/test split that keeps mutation groups intact and roughly preserves
+    class balance by stratifying at the group level.
+    """
+    dataset = preprocess_dataset(records)
+    groups = dataset.groups
+    X = dataset.X
+    y = dataset.y
+    numeric_features = dataset.numerical_features
+    categorical_features = dataset.categorical_features
+
+    # Stratify groups by whether they contain at least one positive.
+    group_frame = pd.DataFrame({"group": groups, "y": y})
+    group_labels = group_frame.groupby("group", sort=False)["y"].max()
+    group_names = group_labels.index.to_numpy()
+    group_y = group_labels.to_numpy()
+
+    splitter = StratifiedShuffleSplit(n_splits=1, test_size=test_size, random_state=random_state)
+    train_gi, test_gi = next(splitter.split(group_names, group_y))
+    train_groups = set(group_names[train_gi])
+    test_mask = groups.isin(group_names[test_gi])
+    train_mask = groups.isin(train_groups)
+
+    X_train = X.loc[train_mask]
+    y_train = y.loc[train_mask]
+    X_test = X.loc[test_mask]
+    y_test = y.loc[test_mask]
+
+    pipeline = make_pipeline(
+        y_train=y_train,
+        numeric_features=numeric_features,
+        categorical_features=categorical_features,
+        random_state=random_state + 1,
+        n_estimators=n_estimators,
+    )
+    pipeline.fit(X_train, y_train)
+    scores = pipeline.predict_proba(X_test)[:, 1]
+    return evaluate_fold(y_test, scores)
+
+
 def main() -> None:
     args = parse_args()
-    log.info("Building candidate table...")
-    bundle = build_candidate_table(
-        args.data_path,
-        sample_rows=args.sample_rows,
-        include_unemitted_truth=args.include_unemitted_truth,
+    log.info("Building emitted-record table (TP vs FP)...")
+    records = build_emitted_record_table(args.data_path, sample_rows=args.sample_rows)
+    log.info(f"Records: {len(records):,}")
+    log.info("Columns kept for modeling are derived; POS/REF/ALT/Dataset are not used as features.")
+
+    if args.folds == 1:
+        log.info("Running single split...")
+        metrics = run_single_split(
+            records,
+            random_state=args.random_state,
+            n_estimators=args.n_estimators,
+        )
+        print(
+            "single_split "
+            f"roc_auc={metrics['roc_auc']:.4f} "
+            f"pr_auc={metrics['pr_auc']:.4f} "
+            f"precision={metrics['precision']:.4f} "
+            f"recall={metrics['recall']:.4f} "
+            f"f1={metrics['f1']:.4f}"
+        )
+        return
+
+    log.info(f"Running cross-validation with fold {args.folds}...")
+    metrics = run_cross_validation(
+        records,
+        folds=args.folds,
+        random_state=args.random_state,
+        n_estimators=args.n_estimators,
     )
-
-    log.info("Candidate table built.")
-    log.info(f"Columns: {list(bundle.X.columns)}")
-
-    # metrics = run_cross_validation(
-    #     bundle,
-    #     folds=args.folds,
-    #     random_state=args.random_state,
-    #     n_estimators=args.n_estimators,
-    # )
-
     summary = metrics.drop(columns=["fold"]).agg(["mean", "std"])
     print("\nCross-validation summary:")
     print(summary.round(4).to_string())
-
 
 
 if __name__ == "__main__":
