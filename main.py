@@ -5,11 +5,8 @@ import logging
 from dataclasses import dataclass
 from typing import List
 
-import datetime
-
 import numpy as np
-from tensorboardX import SummaryWriter
-from xgboost.callback import TrainingCallback
+import matplotlib.pyplot as plt
 import pandas as pd
 from sklearn.compose import ColumnTransformer
 from sklearn.metrics import (
@@ -36,6 +33,7 @@ POSITIVE_CLASS = "TP"
 NEGATIVE_CLASS = "FP"
 EMITTED_CLASSES = (POSITIVE_CLASS, NEGATIVE_CLASS)
 
+
 @dataclass
 class FilteredDataset:
     X: pd.DataFrame
@@ -43,6 +41,7 @@ class FilteredDataset:
     groups: pd.Series
     numerical_features: List[str]
     categorical_features: List[str]
+
 
 def preprocess_dataset(records: pd.DataFrame) -> FilteredDataset:
     categorical_features = ["Caller"]
@@ -71,7 +70,7 @@ def parse_args() -> argparse.Namespace:
         description="Train a per-record XGBoost credibility classifier (TP vs FP) on emitted calls."
     )
     parser.add_argument("--data-path", default=DATA_PATH)
-    parser.add_argument("--folds", type=int, default=1) # should be >=1
+    parser.add_argument("--folds", type=int, default=1)  # should be >=1
     parser.add_argument("--sample-rows", type=int, default=None)
     parser.add_argument("--random-state", type=int, default=7)
     parser.add_argument("--n-estimators", type=int, default=300)
@@ -113,13 +112,15 @@ def add_variant_features(frame: pd.DataFrame) -> pd.DataFrame:
         ],
         dtype=bool,
     )
-    out["snp_substitution_code"] = np.where(is_snp.to_numpy(), np.where(is_ti, 1, 2), 0).astype(
-        int
-    )
+    out["snp_substitution_code"] = np.where(
+        is_snp.to_numpy(), np.where(is_ti, 1, 2), 0
+    ).astype(int)
     return out
 
 
-def build_emitted_record_table(data_path: str, sample_rows: int | None = None) -> pd.DataFrame:
+def build_emitted_record_table(
+    data_path: str, sample_rows: int | None = None
+) -> pd.DataFrame:
     """
     Builds a per-record training table aligned with inference-time inputs:
     one row corresponds to one emitted VCF record from a given caller.
@@ -154,7 +155,11 @@ def build_emitted_record_table(data_path: str, sample_rows: int | None = None) -
 
     # Used only for grouped CV leakage control, not as a feature.
     raw["mutation_group"] = (
-        raw["POS"].astype(str) + ":" + raw["REF"].astype(str) + ">" + raw["ALT"].astype(str)
+        raw["POS"].astype(str)
+        + ":"
+        + raw["REF"].astype(str)
+        + ">"
+        + raw["ALT"].astype(str)
     )
 
     dp = raw["DP"]
@@ -201,15 +206,16 @@ def make_pipeline(
     return Pipeline([("pre", pre), ("model", model)])
 
 
-class TensorBoardCallback(TrainingCallback):
-    def __init__(self, writer: SummaryWriter) -> None:
-        self.writer = writer
-
-    def after_iteration(self, model, epoch: int, evals_log) -> bool:
-        for data_name, metrics in evals_log.items():
-            for metric_name, values in metrics.items():
-                self.writer.add_scalar(f"{data_name}/{metric_name}", values[-1], epoch)
-        return False
+def plot_logloss(curves: list[list[float]], labels: list[str], path: str) -> None:
+    fig, ax = plt.subplots()
+    for label, curve in zip(labels, curves):
+        ax.plot(curve, label=label)
+    ax.set_xlabel("boosting round")
+    ax.set_ylabel("logloss (validation)")
+    ax.legend()
+    fig.savefig(path, dpi=120, bbox_inches="tight")
+    plt.close(fig)
+    log.info(f"Loss curve saved to {path}")
 
 
 def evaluate_fold(y_true: pd.Series, scores: np.ndarray) -> dict[str, float]:
@@ -228,7 +234,9 @@ def evaluate_fold(y_true: pd.Series, scores: np.ndarray) -> dict[str, float]:
     }
 
 
-def run_cross_validation(records: pd.DataFrame, folds: int, random_state: int, n_estimators: int) -> pd.DataFrame:
+def run_cross_validation(
+    records: pd.DataFrame, folds: int, random_state: int, n_estimators: int
+) -> pd.DataFrame:
     dataset = preprocess_dataset(records)
     groups = dataset.groups
     X = dataset.X
@@ -242,7 +250,7 @@ def run_cross_validation(records: pd.DataFrame, folds: int, random_state: int, n
         random_state=random_state,
     )
     metrics = []
-    run_ts = datetime.datetime.now(datetime.UTC).strftime("%Y%m%d_%H%M%S")
+    logloss_curves = []
 
     print(f"Records: {len(X):,}")
     print(f"Features: {len(categorical_features) + len(numeric_features):,}")
@@ -270,9 +278,8 @@ def run_cross_validation(records: pd.DataFrame, folds: int, random_state: int, n
         model = pipeline[-1]
         X_train_t = pre.fit_transform(X_train)
         X_test_t = pre.transform(X_test)
-        with SummaryWriter(log_dir=f"runs/{run_ts}/fold_{fold}") as writer:
-            model.set_params(callbacks=[TensorBoardCallback(writer)])
-            model.fit(X_train_t, y_train, eval_set=[(X_test_t, y_test)], verbose=False)
+        model.fit(X_train_t, y_train, eval_set=[(X_test_t, y_test)], verbose=False)
+        logloss_curves.append(model.evals_result()["validation_0"]["logloss"])
         scores = model.predict_proba(X_test_t)[:, 1]
 
         fold_metrics = evaluate_fold(y_test, scores)
@@ -288,10 +295,17 @@ def run_cross_validation(records: pd.DataFrame, folds: int, random_state: int, n
             f"f1={fold_metrics['f1']:.4f}"
         )
 
+    plot_logloss(
+        logloss_curves,
+        [f"fold {i}" for i in range(1, folds + 1)],
+        "figures/logloss_cv.png",
+    )
     return pd.DataFrame(metrics)
 
 
-def run_single_split(records: pd.DataFrame, random_state: int, n_estimators: int, test_size: float = 0.2) -> dict[str, float]:
+def run_single_split(
+    records: pd.DataFrame, random_state: int, n_estimators: int, test_size: float = 0.2
+) -> dict[str, float]:
     """
     Single train/test split that keeps mutation groups intact and roughly preserves
     class balance by stratifying at the group level.
@@ -309,7 +323,9 @@ def run_single_split(records: pd.DataFrame, random_state: int, n_estimators: int
     group_names = group_labels.index.to_numpy()
     group_y = group_labels.to_numpy()
 
-    splitter = StratifiedShuffleSplit(n_splits=1, test_size=test_size, random_state=random_state)
+    splitter = StratifiedShuffleSplit(
+        n_splits=1, test_size=test_size, random_state=random_state
+    )
     train_gi, test_gi = next(splitter.split(group_names, group_y))
     train_groups = set(group_names[train_gi])
     test_mask = groups.isin(group_names[test_gi])
@@ -331,10 +347,13 @@ def run_single_split(records: pd.DataFrame, random_state: int, n_estimators: int
     model = pipeline[-1]
     X_train_t = pre.fit_transform(X_train)
     X_test_t = pre.transform(X_test)
-    run_ts = datetime.datetime.now(datetime.UTC).strftime("%Y%m%d_%H%M%S")
-    with SummaryWriter(log_dir=f"runs/{run_ts}/single_split") as writer:
-        model.set_params(callbacks=[TensorBoardCallback(writer)])
-        model.fit(X_train_t, y_train, eval_set=[(X_test_t, y_test)], verbose=False)
+    model.fit(X_train_t, y_train, eval_set=[(X_train_t, y_train), (X_test_t, y_test)], verbose=False)
+    result = model.evals_result()
+    plot_logloss(
+        [result["validation_0"]["logloss"], result["validation_1"]["logloss"]],
+        ["train", "validation"],
+        "logloss_single.png",
+    )
     scores = model.predict_proba(X_test_t)[:, 1]
     return evaluate_fold(y_test, scores)
 
@@ -344,7 +363,9 @@ def main() -> None:
     log.info("Building emitted-record table (TP vs FP)...")
     records = build_emitted_record_table(args.data_path, sample_rows=args.sample_rows)
     log.info(f"Records: {len(records):,}")
-    log.info("Columns kept for modeling are derived; POS/REF/ALT/Dataset are not used as features.")
+    log.info(
+        "Columns kept for modeling are derived; POS/REF/ALT/Dataset are not used as features."
+    )
 
     if args.folds == 1:
         log.info("Running single split...")
