@@ -5,7 +5,11 @@ import logging
 from dataclasses import dataclass
 from typing import List
 
+import datetime
+
 import numpy as np
+from tensorboardX import SummaryWriter
+from xgboost.callback import TrainingCallback
 import pandas as pd
 from sklearn.compose import ColumnTransformer
 from sklearn.metrics import (
@@ -26,7 +30,7 @@ logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 log = logging.getLogger("synth4bench")
 
 
-DATA_PATH = "/mnt/data/documents/certh/synth4bench/dataset.tsv"
+DATA_PATH = "~/synth4bench/dataset.tsv"
 
 POSITIVE_CLASS = "TP"
 NEGATIVE_CLASS = "FP"
@@ -197,6 +201,17 @@ def make_pipeline(
     return Pipeline([("pre", pre), ("model", model)])
 
 
+class TensorBoardCallback(TrainingCallback):
+    def __init__(self, writer: SummaryWriter) -> None:
+        self.writer = writer
+
+    def after_iteration(self, model, epoch: int, evals_log) -> bool:
+        for data_name, metrics in evals_log.items():
+            for metric_name, values in metrics.items():
+                self.writer.add_scalar(f"{data_name}/{metric_name}", values[-1], epoch)
+        return False
+
+
 def evaluate_fold(y_true: pd.Series, scores: np.ndarray) -> dict[str, float]:
     predictions = (scores >= 0.5).astype(int)
     tn, fp, fn, tp = confusion_matrix(y_true, predictions, labels=[0, 1]).ravel()
@@ -227,6 +242,7 @@ def run_cross_validation(records: pd.DataFrame, folds: int, random_state: int, n
         random_state=random_state,
     )
     metrics = []
+    run_ts = datetime.datetime.now(datetime.UTC).strftime("%Y%m%d_%H%M%S")
 
     print(f"Records: {len(X):,}")
     print(f"Features: {len(categorical_features) + len(numeric_features):,}")
@@ -250,8 +266,14 @@ def run_cross_validation(records: pd.DataFrame, folds: int, random_state: int, n
             random_state=random_state + fold,
             n_estimators=n_estimators,
         )
-        pipeline.fit(X_train, y_train)
-        scores = pipeline.predict_proba(X_test)[:, 1]
+        pre = pipeline[:-1]
+        model = pipeline[-1]
+        X_train_t = pre.fit_transform(X_train)
+        X_test_t = pre.transform(X_test)
+        with SummaryWriter(log_dir=f"runs/{run_ts}/fold_{fold}") as writer:
+            model.set_params(callbacks=[TensorBoardCallback(writer)])
+            model.fit(X_train_t, y_train, eval_set=[(X_test_t, y_test)], verbose=False)
+        scores = model.predict_proba(X_test_t)[:, 1]
 
         fold_metrics = evaluate_fold(y_test, scores)
         fold_metrics["fold"] = float(fold)
@@ -305,8 +327,15 @@ def run_single_split(records: pd.DataFrame, random_state: int, n_estimators: int
         random_state=random_state + 1,
         n_estimators=n_estimators,
     )
-    pipeline.fit(X_train, y_train)
-    scores = pipeline.predict_proba(X_test)[:, 1]
+    pre = pipeline[:-1]
+    model = pipeline[-1]
+    X_train_t = pre.fit_transform(X_train)
+    X_test_t = pre.transform(X_test)
+    run_ts = datetime.datetime.now(datetime.UTC).strftime("%Y%m%d_%H%M%S")
+    with SummaryWriter(log_dir=f"runs/{run_ts}/single_split") as writer:
+        model.set_params(callbacks=[TensorBoardCallback(writer)])
+        model.fit(X_train_t, y_train, eval_set=[(X_test_t, y_test)], verbose=False)
+    scores = model.predict_proba(X_test_t)[:, 1]
     return evaluate_fold(y_test, scores)
 
 
