@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import datetime
 import logging
 from dataclasses import dataclass
+from pathlib import Path
 from typing import List
 
+import joblib
 import numpy as np
 import matplotlib.pyplot as plt
 import pandas as pd
@@ -74,6 +77,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sample-rows", type=int, default=None)
     parser.add_argument("--random-state", type=int, default=7)
     parser.add_argument("--n-estimators", type=int, default=300)
+    parser.add_argument("--early-stopping-rounds", type=int, default=20)
+    parser.add_argument("--save-model", action=argparse.BooleanOptionalAction, default=True)
     return parser.parse_args()
 
 
@@ -175,6 +180,7 @@ def make_pipeline(
     categorical_features: list[str],
     random_state: int,
     n_estimators: int,
+    early_stopping_rounds: int = 20,
 ) -> Pipeline:
     positives = int(y_train.sum())
     negatives = int(len(y_train) - positives)
@@ -200,6 +206,7 @@ def make_pipeline(
         colsample_bytree=0.8,
         reg_lambda=2.0,
         scale_pos_weight=scale_pos_weight,
+        early_stopping_rounds=early_stopping_rounds,
         random_state=random_state,
         n_jobs=-1,
     )
@@ -209,6 +216,7 @@ def make_pipeline(
 def plot_logloss(curves: list[list[float]], labels: list[str], path: str) -> None:
     fig, ax = plt.subplots()
     for label, curve in zip(labels, curves):
+        log.info(f"Label for curve {label}")
         ax.plot(curve, label=label)
     ax.set_xlabel("boosting round")
     ax.set_ylabel("logloss (validation)")
@@ -216,6 +224,18 @@ def plot_logloss(curves: list[list[float]], labels: list[str], path: str) -> Non
     fig.savefig(path, dpi=120, bbox_inches="tight")
     plt.close(fig)
     log.info(f"Loss curve saved to {path}")
+
+
+def save_model(pre, model) -> None:
+    path = Path("saved_models") / f"model_{datetime.datetime.now(datetime.UTC).strftime('%Y%m%d')}.joblib"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    joblib.dump({"pre": pre, "model": model}, path)
+    log.info(f"Model saved to {path}")
+
+
+def load_model(path: str):
+    obj = joblib.load(path)
+    return obj["pre"], obj["model"]
 
 
 def evaluate_fold(y_true: pd.Series, scores: np.ndarray) -> dict[str, float]:
@@ -235,7 +255,7 @@ def evaluate_fold(y_true: pd.Series, scores: np.ndarray) -> dict[str, float]:
 
 
 def run_cross_validation(
-    records: pd.DataFrame, folds: int, random_state: int, n_estimators: int
+    records: pd.DataFrame, folds: int, random_state: int, n_estimators: int, early_stopping_rounds: int = 20
 ) -> pd.DataFrame:
     dataset = preprocess_dataset(records)
     groups = dataset.groups
@@ -273,6 +293,7 @@ def run_cross_validation(
             categorical_features=categorical_features,
             random_state=random_state + fold,
             n_estimators=n_estimators,
+            early_stopping_rounds=early_stopping_rounds,
         )
         pre = pipeline[:-1]
         model = pipeline[-1]
@@ -304,11 +325,17 @@ def run_cross_validation(
 
 
 def run_single_split(
-    records: pd.DataFrame, random_state: int, n_estimators: int, test_size: float = 0.2
+    records: pd.DataFrame,
+    random_state: int,
+    n_estimators: int,
+    early_stopping_rounds: int = 20,
+    test_size: float = 0.2,
+    val_size: float = 0.2,
 ) -> dict[str, float]:
     """
-    Single train/test split that keeps mutation groups intact and roughly preserves
-    class balance by stratifying at the group level.
+    Three-way split (train / val / test) that keeps mutation groups intact and
+    roughly preserves class balance by stratifying at the group level.
+    val is passed to eval_set for monitoring; test is touched only for final metrics.
     """
     dataset = preprocess_dataset(records)
     groups = dataset.groups
@@ -317,24 +344,35 @@ def run_single_split(
     numeric_features = dataset.numerical_features
     categorical_features = dataset.categorical_features
 
-    # Stratify groups by whether they contain at least one positive.
     group_frame = pd.DataFrame({"group": groups, "y": y})
     group_labels = group_frame.groupby("group", sort=False)["y"].max()
     group_names = group_labels.index.to_numpy()
     group_y = group_labels.to_numpy()
 
-    splitter = StratifiedShuffleSplit(
-        n_splits=1, test_size=test_size, random_state=random_state
-    )
-    train_gi, test_gi = next(splitter.split(group_names, group_y))
-    train_groups = set(group_names[train_gi])
-    test_mask = groups.isin(group_names[test_gi])
-    train_mask = groups.isin(train_groups)
+    # First split: hold out test.
+    splitter = StratifiedShuffleSplit(n_splits=1, test_size=test_size, random_state=random_state)
+    trainval_gi, test_gi = next(splitter.split(group_names, group_y))
 
-    X_train = X.loc[train_mask]
-    y_train = y.loc[train_mask]
-    X_test = X.loc[test_mask]
-    y_test = y.loc[test_mask]
+    # Second split: carve val out of trainval.
+    trainval_names = group_names[trainval_gi]
+    trainval_y = group_y[trainval_gi]
+    splitter2 = StratifiedShuffleSplit(n_splits=1, test_size=val_size, random_state=random_state)
+    train_gi_rel, val_gi_rel = next(splitter2.split(trainval_names, trainval_y))
+
+    train_mask = groups.isin(set(trainval_names[train_gi_rel]))
+    val_mask = groups.isin(set(trainval_names[val_gi_rel]))
+    test_mask = groups.isin(set(group_names[test_gi]))
+
+    X_train, y_train = X.loc[train_mask], y.loc[train_mask]
+    X_val, y_val = X.loc[val_mask], y.loc[val_mask]
+    X_test, y_test = X.loc[test_mask], y.loc[test_mask]
+
+    total = len(X)
+    log.info(
+        f"Split — train: {len(X_train):,} ({len(X_train)/total:.0%})  "
+        f"val: {len(X_val):,} ({len(X_val)/total:.0%})  "
+        f"test: {len(X_test):,} ({len(X_test)/total:.0%})"
+    )
 
     pipeline = make_pipeline(
         y_train=y_train,
@@ -342,37 +380,43 @@ def run_single_split(
         categorical_features=categorical_features,
         random_state=random_state + 1,
         n_estimators=n_estimators,
+        early_stopping_rounds=early_stopping_rounds,
     )
     pre = pipeline[:-1]
     model = pipeline[-1]
     X_train_t = pre.fit_transform(X_train)
+    X_val_t = pre.transform(X_val)
     X_test_t = pre.transform(X_test)
-    model.fit(X_train_t, y_train, eval_set=[(X_train_t, y_train), (X_test_t, y_test)], verbose=False)
+    model.fit(X_train_t, y_train, eval_set=[(X_train_t, y_train), (X_val_t, y_val)], verbose=False)
     result = model.evals_result()
     plot_logloss(
         [result["validation_0"]["logloss"], result["validation_1"]["logloss"]],
-        ["train", "validation"],
-        "logloss_single.png",
+        ["train", "val"],
+        "figures/logloss_single.png",
     )
     scores = model.predict_proba(X_test_t)[:, 1]
-    return evaluate_fold(y_test, scores)
+    return evaluate_fold(y_test, scores), pre, model
 
 
 def main() -> None:
     args = parse_args()
     log.info("Building emitted-record table (TP vs FP)...")
     records = build_emitted_record_table(args.data_path, sample_rows=args.sample_rows)
-    log.info(f"Records: {len(records):,}")
+    if args.sample_rows is None:
+        log.info(f"Records: {len(records):,} (full dataset)")
+    else:
+        log.info(f"Records: {len(records):,} (subsample, requested {args.sample_rows:,})")
     log.info(
         "Columns kept for modeling are derived; POS/REF/ALT/Dataset are not used as features."
     )
 
     if args.folds == 1:
         log.info("Running single split...")
-        metrics = run_single_split(
+        metrics, pre, model = run_single_split(
             records,
             random_state=args.random_state,
             n_estimators=args.n_estimators,
+            early_stopping_rounds=args.early_stopping_rounds,
         )
         print(
             "single_split "
@@ -382,6 +426,8 @@ def main() -> None:
             f"recall={metrics['recall']:.4f} "
             f"f1={metrics['f1']:.4f}"
         )
+        if args.save_model:
+            save_model(pre, model)
         return
 
     log.info(f"Running cross-validation with fold {args.folds}...")
@@ -390,6 +436,7 @@ def main() -> None:
         folds=args.folds,
         random_state=args.random_state,
         n_estimators=args.n_estimators,
+        early_stopping_rounds=args.early_stopping_rounds,
     )
     summary = metrics.drop(columns=["fold"]).agg(["mean", "std"])
     print("\nCross-validation summary:")
