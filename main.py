@@ -274,6 +274,7 @@ def run_cross_validation(
 
     print(f"Records: {len(X):,}")
     print(f"Features: {len(categorical_features) + len(numeric_features):,}")
+    print(f"Unique mutation groups: {groups.nunique():,} ({groups.nunique() / len(X):.1%} of records)")
     print(f"Positive label rate: {y.mean():.4f}")
     print(f"Groups for CV: {groups.nunique():,}")
     print()
