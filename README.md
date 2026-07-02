@@ -16,9 +16,4 @@ Check cli args:
 uv run python main.py --help
 ```
 
-Under this project, we have also clone the `variant-classification` project:
-```shell
-git clone https://github.com/sfragkoul/variant-classification
-```
-
 Datasets are expected to be under `./datasets`. Model states are saved under `./saved_models`, and figures under `./figures`.
