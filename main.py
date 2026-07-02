@@ -214,6 +214,8 @@ def make_pipeline(
 
 
 def plot_logloss(curves: list[list[float]], labels: list[str], path: str) -> None:
+    output_path = Path(path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     fig, ax = plt.subplots()
     for label, curve in zip(labels, curves):
         log.info(f"Label for curve {label}")
@@ -221,9 +223,9 @@ def plot_logloss(curves: list[list[float]], labels: list[str], path: str) -> Non
     ax.set_xlabel("boosting round")
     ax.set_ylabel("logloss (validation)")
     ax.legend()
-    fig.savefig(path, dpi=120, bbox_inches="tight")
+    fig.savefig(output_path, dpi=120, bbox_inches="tight")
     plt.close(fig)
-    log.info(f"Loss curve saved to {path}")
+    log.info(f"Loss curve saved to {output_path}")
 
 
 def save_model(pre, model) -> None:
@@ -241,9 +243,19 @@ def load_model(path: str):
 def evaluate_fold(y_true: pd.Series, scores: np.ndarray) -> dict[str, float]:
     predictions = (scores >= 0.5).astype(int)
     tn, fp, fn, tp = confusion_matrix(y_true, predictions, labels=[0, 1]).ravel()
+    unique_classes = pd.Series(y_true).nunique()
+    roc_auc = float("nan")
+    pr_auc = float("nan")
+
+    if unique_classes < 2:
+        log.warning("Fold contains a single class; roc_auc and pr_auc are undefined for this split.")
+    else:
+        roc_auc = roc_auc_score(y_true, scores)
+        pr_auc = average_precision_score(y_true, scores)
+
     return {
-        "roc_auc": roc_auc_score(y_true, scores),
-        "pr_auc": average_precision_score(y_true, scores),
+        "roc_auc": roc_auc,
+        "pr_auc": pr_auc,
         "precision": precision_score(y_true, predictions, zero_division=0),
         "recall": recall_score(y_true, predictions, zero_division=0),
         "f1": f1_score(y_true, predictions, zero_division=0),
@@ -254,8 +266,32 @@ def evaluate_fold(y_true: pd.Series, scores: np.ndarray) -> dict[str, float]:
     }
 
 
+def split_train_val_groups(
+    groups: pd.Series,
+    y: pd.Series,
+    val_size: float,
+    random_state: int,
+) -> tuple[pd.Series, pd.Series]:
+    group_frame = pd.DataFrame({"group": groups, "y": y})
+    group_labels = group_frame.groupby("group", sort=False)["y"].max()
+    group_names = group_labels.index.to_numpy()
+    group_y = group_labels.to_numpy()
+
+    splitter = StratifiedShuffleSplit(n_splits=1, test_size=val_size, random_state=random_state)
+    train_gi, val_gi = next(splitter.split(group_names, group_y))
+
+    train_mask = groups.isin(set(group_names[train_gi]))
+    val_mask = groups.isin(set(group_names[val_gi]))
+    return train_mask, val_mask
+
+
 def run_cross_validation(
-    records: pd.DataFrame, folds: int, random_state: int, n_estimators: int, early_stopping_rounds: int = 20
+    records: pd.DataFrame,
+    folds: int,
+    random_state: int,
+    n_estimators: int,
+    early_stopping_rounds: int = 20,
+    val_size: float = 0.2,
 ) -> pd.DataFrame:
     dataset = preprocess_dataset(records)
     groups = dataset.groups
@@ -287,9 +323,21 @@ def run_cross_validation(
         X_test = X.iloc[test_index]
         y_train = y.iloc[train_index]
         y_test = y.iloc[test_index]
+        groups_train = groups.iloc[train_index]
+
+        train_mask, val_mask = split_train_val_groups(
+            groups=groups_train,
+            y=y_train,
+            val_size=val_size,
+            random_state=random_state + fold,
+        )
+        X_fold_train = X_train.loc[train_mask]
+        y_fold_train = y_train.loc[train_mask]
+        X_fold_val = X_train.loc[val_mask]
+        y_fold_val = y_train.loc[val_mask]
 
         pipeline = make_pipeline(
-            y_train=y_train,
+            y_train=y_fold_train,
             numeric_features=numeric_features,
             categorical_features=categorical_features,
             random_state=random_state + fold,
@@ -298,9 +346,10 @@ def run_cross_validation(
         )
         pre = pipeline[:-1]
         model = pipeline[-1]
-        X_train_t = pre.fit_transform(X_train)
+        X_train_t = pre.fit_transform(X_fold_train)
+        X_val_t = pre.transform(X_fold_val)
         X_test_t = pre.transform(X_test)
-        model.fit(X_train_t, y_train, eval_set=[(X_test_t, y_test)], verbose=False)
+        model.fit(X_train_t, y_fold_train, eval_set=[(X_val_t, y_fold_val)], verbose=False)
         logloss_curves.append(model.evals_result()["validation_0"]["logloss"])
         scores = model.predict_proba(X_test_t)[:, 1]
 
@@ -356,12 +405,18 @@ def run_single_split(
 
     # Second split: carve val out of trainval.
     trainval_names = group_names[trainval_gi]
-    trainval_y = group_y[trainval_gi]
-    splitter2 = StratifiedShuffleSplit(n_splits=1, test_size=val_size, random_state=random_state)
-    train_gi_rel, val_gi_rel = next(splitter2.split(trainval_names, trainval_y))
+    trainval_mask = groups.isin(set(trainval_names))
+    train_mask_rel, val_mask_rel = split_train_val_groups(
+        groups=groups.loc[trainval_mask],
+        y=y.loc[trainval_mask],
+        val_size=val_size,
+        random_state=random_state,
+    )
 
-    train_mask = groups.isin(set(trainval_names[train_gi_rel]))
-    val_mask = groups.isin(set(trainval_names[val_gi_rel]))
+    train_mask = pd.Series(False, index=groups.index)
+    val_mask = pd.Series(False, index=groups.index)
+    train_mask.loc[trainval_mask] = train_mask_rel.to_numpy()
+    val_mask.loc[trainval_mask] = val_mask_rel.to_numpy()
     test_mask = groups.isin(set(group_names[test_gi]))
 
     X_train, y_train = X.loc[train_mask], y.loc[train_mask]
