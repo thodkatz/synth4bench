@@ -134,7 +134,6 @@ def build_emitted_record_table(
     and therefore aren't suitable for this per-record credibility model.
     """
     usecols = [
-        "Dataset",
         "Coverage",
         "Read_length",
         "POS",
@@ -264,6 +263,116 @@ def evaluate_fold(y_true: pd.Series, scores: np.ndarray) -> dict[str, float]:
         "tn": float(tn),
         "fn": float(fn),
     }
+
+
+def evaluate_predictions(y_true: pd.Series, predictions: np.ndarray) -> dict[str, float]:
+    tn, fp, fn, tp = confusion_matrix(y_true, predictions, labels=[0, 1]).ravel()
+    return {
+        "precision": precision_score(y_true, predictions, zero_division=0),
+        "recall": recall_score(y_true, predictions, zero_division=0),
+        "f1": f1_score(y_true, predictions, zero_division=0),
+        "tp": float(tp),
+        "fp": float(fp),
+        "tn": float(tn),
+        "fn": float(fn),
+    }
+
+
+def evaluate_by_caller(
+    callers: pd.Series, y_true: pd.Series, scores: np.ndarray, threshold: float = 0.5
+) -> pd.DataFrame:
+    rows = []
+    for caller in sorted(callers.astype(str).unique()):
+        mask = callers == caller
+        caller_y = y_true.loc[mask]
+        caller_scores = scores[mask.to_numpy()]
+
+        baseline_predictions = np.ones(len(caller_y), dtype=int)
+        model_predictions = (caller_scores >= threshold).astype(int)
+
+        baseline = evaluate_predictions(caller_y, baseline_predictions)
+        model = evaluate_predictions(caller_y, model_predictions)
+
+        rows.append(
+            {
+                "caller": caller,
+                "records": float(len(caller_y)),
+                "baseline_precision": baseline["precision"],
+                "baseline_recall": baseline["recall"],
+                "baseline_f1": baseline["f1"],
+                "baseline_fp": baseline["fp"],
+                "baseline_tp": baseline["tp"],
+                "model_precision": model["precision"],
+                "model_recall": model["recall"],
+                "model_f1": model["f1"],
+                "model_fp": model["fp"],
+                "model_tp": model["tp"],
+                "fp_reduction": baseline["fp"] - model["fp"],
+                "tp_loss": baseline["tp"] - model["tp"],
+                "tp_retention_pct": (model["tp"] / baseline["tp"] * 100.0) if baseline["tp"] else 0.0,
+                "fp_reduction_pct": (baseline["fp"] - model["fp"]) / baseline["fp"] * 100.0 if baseline["fp"] else 0.0,
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+def print_caller_report(report: pd.DataFrame) -> None:
+    print("\nPer-caller held-out metrics:")
+    for row in report.sort_values("caller").itertuples(index=False):
+        print(
+            f"{row.caller} "
+            f"records={int(row.records):,} "
+            f"baseline_precision={row.baseline_precision:.4f} "
+            f"model_precision={row.model_precision:.4f} "
+            f"baseline_recall={row.baseline_recall:.4f} "
+            f"model_recall={row.model_recall:.4f} "
+            f"baseline_f1={row.baseline_f1:.4f} "
+            f"model_f1={row.model_f1:.4f} "
+            f"fp_reduction={int(row.fp_reduction):,} "
+            f"fp_reduction_pct={row.fp_reduction_pct:.2f}% "
+            f"tp_loss={int(row.tp_loss):,} "
+            f"tp_retention_pct={row.tp_retention_pct:.2f}%"
+        )
+
+
+def plot_caller_tradeoff(report: pd.DataFrame, path: str) -> None:
+    output_path = Path(path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    report = report.sort_values("caller").reset_index(drop=True)
+    callers = report["caller"].tolist()
+    positions = np.arange(len(callers))
+
+    model_tp_retention = (
+        (report["model_tp"] / report["baseline_tp"]).replace([np.inf, -np.inf], np.nan).fillna(0.0) * 100.0
+    )
+    model_fp_removed = (
+        (report["fp_reduction"] / report["baseline_fp"]).replace([np.inf, -np.inf], np.nan).fillna(0.0) * 100.0
+    )
+
+    tp_min = max(0.0, float(model_tp_retention.min()) - 1.0)
+    tp_max = min(100.5, float(model_tp_retention.max()) + 0.2)
+    fp_min = max(0.0, float(model_fp_removed.min()) - 1.0)
+    fp_max = min(100.5, float(model_fp_removed.max()) + 0.2)
+
+    fig, axes = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
+
+    axes[0].bar(positions, model_tp_retention, color="#2c7fb8")
+    axes[0].set_ylim(tp_min, tp_max)
+    axes[0].set_ylabel("TP kept %")
+    axes[0].set_title("Per-caller tradeoff on held-out data")
+
+    axes[1].bar(positions, model_fp_removed, color="#d95f0e")
+    axes[1].set_ylim(fp_min, fp_max)
+    axes[1].set_ylabel("FP removed %")
+    axes[1].set_xticks(positions)
+    axes[1].set_xticklabels(callers)
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=120, bbox_inches="tight")
+    plt.close(fig)
+    log.info(f"Caller tradeoff plot saved to {output_path}")
 
 
 def split_train_val_groups(
@@ -451,7 +560,8 @@ def run_single_split(
         "figures/logloss_single.png",
     )
     scores = model.predict_proba(X_test_t)[:, 1]
-    return evaluate_fold(y_test, scores), pre, model
+    caller_report = evaluate_by_caller(X_test["Caller"], y_test, scores)
+    return evaluate_fold(y_test, scores), caller_report, pre, model
 
 
 def main() -> None:
@@ -468,7 +578,7 @@ def main() -> None:
 
     if args.folds == 1:
         log.info("Running single split...")
-        metrics, pre, model = run_single_split(
+        metrics, caller_report, pre, model = run_single_split(
             records,
             random_state=args.random_state,
             n_estimators=args.n_estimators,
@@ -482,6 +592,8 @@ def main() -> None:
             f"recall={metrics['recall']:.4f} "
             f"f1={metrics['f1']:.4f}"
         )
+        print_caller_report(caller_report)
+        plot_caller_tradeoff(caller_report, "figures/caller_tradeoff.png")
         if args.save_model:
             save_model(pre, model)
         return
