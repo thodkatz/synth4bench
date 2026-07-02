@@ -30,7 +30,7 @@ logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 log = logging.getLogger("synth4bench")
 
 
-DATA_PATH = "~/synth4bench/dataset.tsv"
+DATA_PATH = "./datasets/dataset.tsv"
 
 POSITIVE_CLASS = "TP"
 NEGATIVE_CLASS = "FP"

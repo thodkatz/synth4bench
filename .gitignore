@@ -13,3 +13,6 @@ wheels/
 runs/
 figures
 saved_models
+
+docs
+datasets
