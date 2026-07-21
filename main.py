@@ -36,6 +36,11 @@ POSITIVE_CLASS = "TP"
 NEGATIVE_CLASS = "FP"
 EMITTED_CLASSES = (POSITIVE_CLASS, NEGATIVE_CLASS)
 
+# Confusion-matrix axis labels. The dataset's own class names (TP/FP/FN) would be
+# ambiguous next to confusion-matrix terminology (e.g. "TP of the TP class"), so
+# the matrix axes use plain aliases instead: A=TP, B=FP.
+CLASS_ALIASES = {1: "A", 0: "B"}
+
 
 @dataclass
 class FilteredDataset:
@@ -336,43 +341,50 @@ def print_caller_report(report: pd.DataFrame) -> None:
         )
 
 
-def plot_caller_tradeoff(report: pd.DataFrame, path: str) -> None:
+def plot_confusion_matrix_by_caller(
+    callers: pd.Series, y_true: pd.Series, scores: np.ndarray, path: str, threshold: float = 0.5
+) -> None:
     output_path = Path(path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    report = report.sort_values("caller").reset_index(drop=True)
-    callers = report["caller"].tolist()
-    positions = np.arange(len(callers))
+    predictions = (scores >= threshold).astype(int)
+    class_order = sorted(CLASS_ALIASES, reverse=True)  # [1, 0] -> A, B
+    class_display = [CLASS_ALIASES[c] for c in class_order]
 
-    model_tp_retention = (
-        (report["model_tp"] / report["baseline_tp"]).replace([np.inf, -np.inf], np.nan).fillna(0.0) * 100.0
-    )
-    model_fp_removed = (
-        (report["fp_reduction"] / report["baseline_fp"]).replace([np.inf, -np.inf], np.nan).fillna(0.0) * 100.0
-    )
+    caller_list = sorted(callers.astype(str).unique())
+    ncols = min(len(caller_list), 3)
+    nrows = -(-len(caller_list) // ncols)
+    fig, axes = plt.subplots(nrows, ncols, figsize=(4 * ncols, 4 * nrows), squeeze=False)
 
-    tp_min = max(0.0, float(model_tp_retention.min()) - 1.0)
-    tp_max = min(100.5, float(model_tp_retention.max()) + 0.2)
-    fp_min = max(0.0, float(model_fp_removed.min()) - 1.0)
-    fp_max = min(100.5, float(model_fp_removed.max()) + 0.2)
+    for idx, caller in enumerate(caller_list):
+        ax = axes[idx // ncols][idx % ncols]
+        mask = (callers == caller).to_numpy()
+        cm = confusion_matrix(y_true.loc[mask], predictions[mask], labels=class_order)
 
-    fig, axes = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
+        ax.imshow(cm, cmap="Blues")
+        ax.set_title(caller)
+        ax.set_xticks(range(len(class_display)))
+        ax.set_xticklabels(class_display)
+        ax.set_yticks(range(len(class_display)))
+        ax.set_yticklabels(class_display)
+        ax.set_xlabel("Predicted")
+        ax.set_ylabel("Actual")
+        for i in range(cm.shape[0]):
+            for j in range(cm.shape[1]):
+                ax.text(
+                    j, i, f"{cm[i, j]:,}",
+                    ha="center", va="center",
+                    color="white" if cm[i, j] > cm.max() / 2 else "black",
+                )
 
-    axes[0].bar(positions, model_tp_retention, color="#2c7fb8")
-    axes[0].set_ylim(tp_min, tp_max)
-    axes[0].set_ylabel("TP kept %")
-    axes[0].set_title("Per-caller tradeoff on held-out data")
+    for idx in range(len(caller_list), nrows * ncols):
+        axes[idx // ncols][idx % ncols].axis("off")
 
-    axes[1].bar(positions, model_fp_removed, color="#d95f0e")
-    axes[1].set_ylim(fp_min, fp_max)
-    axes[1].set_ylabel("FP removed %")
-    axes[1].set_xticks(positions)
-    axes[1].set_xticklabels(callers)
-
+    fig.suptitle("Per-caller confusion matrix (A=TP, B=FP)")
     fig.tight_layout()
     fig.savefig(output_path, dpi=120, bbox_inches="tight")
     plt.close(fig)
-    log.info(f"Caller tradeoff plot saved to {output_path}")
+    log.info(f"Per-caller confusion matrix saved to {output_path}")
 
 
 def split_train_val_groups(
@@ -561,6 +573,9 @@ def run_single_split(
     )
     scores = model.predict_proba(X_test_t)[:, 1]
     caller_report = evaluate_by_caller(X_test["Caller"], y_test, scores)
+    plot_confusion_matrix_by_caller(
+        X_test["Caller"], y_test, scores, "figures/confusion_matrix_by_caller.png"
+    )
     return evaluate_fold(y_test, scores), caller_report, pre, model
 
 
@@ -593,7 +608,6 @@ def main() -> None:
             f"f1={metrics['f1']:.4f}"
         )
         print_caller_report(caller_report)
-        plot_caller_tradeoff(caller_report, "figures/caller_tradeoff.png")
         if args.save_model:
             save_model(pre, model)
         return

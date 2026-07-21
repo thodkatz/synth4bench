@@ -10,6 +10,7 @@ wheels/
 .venv
 
 .codex
+.claude
 runs/
 figures
 saved_models
