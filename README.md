@@ -16,7 +16,7 @@ Check cli args:
 uv run python main.py --help
 ```
 
-Datasets are expected to be under `./datasets`. Model states are saved under `./saved_models`, and figures under `./figures`.
+Datasets are expected to be under `./datasets`. Model states are saved under `./saved_models`, figures under `./figures`, and evaluation results (CSV) under `./results`.
 
 # 2vs3 classes
 

@@ -576,6 +576,28 @@ def run_single_split(
     return evaluate_fold(y_test, scores), caller_report, pre, model
 
 
+def save_single_split_results(
+    metrics: dict[str, float], caller_report: pd.DataFrame, path: str = "results/single_split_metrics.csv"
+) -> None:
+    output_path = Path(path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame([metrics]).to_csv(output_path, index=False)
+    caller_path = output_path.with_name(f"{output_path.stem}_by_caller.csv")
+    caller_report.to_csv(caller_path, index=False)
+    log.info(f"Results saved to {output_path} and {caller_path}")
+
+
+def save_cv_results(
+    metrics: pd.DataFrame, summary: pd.DataFrame, path: str = "results/cv_metrics.csv"
+) -> None:
+    output_path = Path(path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    metrics.to_csv(output_path, index=False)
+    summary_path = output_path.with_name(f"{output_path.stem}_summary.csv")
+    summary.to_csv(summary_path)
+    log.info(f"Results saved to {output_path} and {summary_path}")
+
+
 def main() -> None:
     args = parse_args()
     log.info("Building record table (TP vs FP vs FN)...")
@@ -605,6 +627,7 @@ def main() -> None:
             f"f1_macro={metrics['f1_macro']:.4f}"
         )
         print_caller_report(caller_report)
+        save_single_split_results(metrics, caller_report)
         if args.save_model:
             save_model(pre, model)
         return
@@ -620,6 +643,7 @@ def main() -> None:
     summary = metrics.drop(columns=["fold"]).agg(["mean", "std"])
     print("\nCross-validation summary:")
     print(summary.round(4).to_string())
+    save_cv_results(metrics, summary)
 
 
 if __name__ == "__main__":
