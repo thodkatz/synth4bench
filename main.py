@@ -23,7 +23,8 @@ from sklearn.metrics import (
 from sklearn.model_selection import StratifiedGroupKFold
 from sklearn.model_selection import StratifiedShuffleSplit
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OneHotEncoder
+from sklearn.preprocessing import OneHotEncoder, label_binarize
+from sklearn.utils.class_weight import compute_sample_weight
 from xgboost import XGBClassifier
 
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
@@ -32,14 +33,9 @@ log = logging.getLogger("synth4bench")
 
 DATA_PATH = "./datasets/dataset.tsv"
 
-POSITIVE_CLASS = "TP"
-NEGATIVE_CLASS = "FP"
-EMITTED_CLASSES = (POSITIVE_CLASS, NEGATIVE_CLASS)
-
-# Confusion-matrix axis labels. The dataset's own class names (TP/FP/FN) would be
-# ambiguous next to confusion-matrix terminology (e.g. "TP of the TP class"), so
-# the matrix axes use plain aliases instead: A=TP, B=FP.
-CLASS_ALIASES = {1: "A", 0: "B"}
+CLASS_TO_CODE = {"FP": 0, "FN": 1, "TP": 2}
+CODE_TO_CLASS = {v: k for k, v in CLASS_TO_CODE.items()}
+CLASS_LABELS = [CODE_TO_CLASS[c] for c in sorted(CODE_TO_CLASS)]  # ["FP", "FN", "TP"]
 
 
 @dataclass
@@ -75,7 +71,7 @@ def preprocess_dataset(records: pd.DataFrame) -> FilteredDataset:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Train a per-record XGBoost credibility classifier (TP vs FP) on emitted calls."
+        description="Train a per-record XGBoost credibility classifier (TP vs FP vs FN) on candidate mutations."
     )
     parser.add_argument("--data-path", default=DATA_PATH)
     parser.add_argument("--folds", type=int, default=1)  # should be >=1
@@ -128,15 +124,23 @@ def add_variant_features(frame: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def build_emitted_record_table(
+def build_record_table(
     data_path: str, sample_rows: int | None = None
 ) -> pd.DataFrame:
     """
-    Builds a per-record training table aligned with inference-time inputs:
-    one row corresponds to one emitted VCF record from a given caller.
+    Builds a per-record training table for a 3-class TP/FP/FN classifier.
 
-    We train only on emitted calls: TP vs FP. FN/TN do not exist as records in the VCF,
-    and therefore aren't suitable for this per-record credibility model.
+    TP/FP rows correspond to a caller's emitted VCF record (DP/AF observed by
+    that caller). FN rows correspond to a ground-truth mutation `Caller` did
+    not call at all — DP/AF for those rows are the ground-truth values, not
+    anything the caller emitted.
+
+    Deployment caveat: because FN rows are keyed to a known ground-truth
+    mutation, scoring a candidate as TP/FP/FN requires a candidate mutation
+    list up front (e.g. a truth set, or this synthetic benchmark itself).
+    Unlike the old TP/FP-only filter, this model cannot be pointed at a
+    caller's raw VCF output alone to discover what it missed — a caller
+    produces no record for a mutation it didn't call.
     """
     usecols = [
         "Coverage",
@@ -157,8 +161,8 @@ def build_emitted_record_table(
         low_memory=False,
     )
 
-    raw = raw.loc[raw["Class"].isin(EMITTED_CLASSES)].copy()
-    raw["label"] = (raw["Class"] == POSITIVE_CLASS).astype(int)
+    raw = raw.loc[raw["Class"].isin(CLASS_TO_CODE)].copy()
+    raw["label"] = raw["Class"].map(CLASS_TO_CODE).astype(int)
 
     raw = add_variant_features(raw)
 
@@ -179,17 +183,12 @@ def build_emitted_record_table(
 
 
 def make_pipeline(
-    y_train: pd.Series,
     numeric_features: list[str],
     categorical_features: list[str],
     random_state: int,
     n_estimators: int,
     early_stopping_rounds: int = 20,
 ) -> Pipeline:
-    positives = int(y_train.sum())
-    negatives = int(len(y_train) - positives)
-    scale_pos_weight = negatives / positives if positives else 1.0
-
     pre = ColumnTransformer(
         transformers=[
             ("cat", OneHotEncoder(handle_unknown="ignore"), categorical_features),
@@ -199,8 +198,9 @@ def make_pipeline(
     )
 
     model = XGBClassifier(
-        objective="binary:logistic",
-        eval_metric="logloss",
+        objective="multi:softprob",
+        eval_metric="mlogloss",
+        num_class=len(CLASS_TO_CODE),
         tree_method="hist",
         n_estimators=n_estimators,
         learning_rate=0.05,
@@ -209,7 +209,6 @@ def make_pipeline(
         subsample=0.8,
         colsample_bytree=0.8,
         reg_lambda=2.0,
-        scale_pos_weight=scale_pos_weight,
         early_stopping_rounds=early_stopping_rounds,
         random_state=random_state,
         n_jobs=-1,
@@ -244,9 +243,36 @@ def load_model(path: str):
     return obj["pre"], obj["model"]
 
 
+LABELS = sorted(CODE_TO_CLASS)  # [0, 1, 2]
+
+
+def evaluate_predictions(y_true: pd.Series, predictions: np.ndarray) -> dict[str, float]:
+    cm = confusion_matrix(y_true, predictions, labels=LABELS)
+    precision = precision_score(y_true, predictions, labels=LABELS, average=None, zero_division=0)
+    recall = recall_score(y_true, predictions, labels=LABELS, average=None, zero_division=0)
+    f1 = f1_score(y_true, predictions, labels=LABELS, average=None, zero_division=0)
+    support = cm.sum(axis=1)
+
+    metrics: dict[str, float] = {
+        "precision_macro": precision_score(y_true, predictions, labels=LABELS, average="macro", zero_division=0),
+        "recall_macro": recall_score(y_true, predictions, labels=LABELS, average="macro", zero_division=0),
+        "f1_macro": f1_score(y_true, predictions, labels=LABELS, average="macro", zero_division=0),
+    }
+    for code in LABELS:
+        name = CODE_TO_CLASS[code]
+        metrics[f"precision_{name}"] = float(precision[code])
+        metrics[f"recall_{name}"] = float(recall[code])
+        metrics[f"f1_{name}"] = float(f1[code])
+        metrics[f"support_{name}"] = float(support[code])
+        for pred_code in LABELS:
+            metrics[f"cm_{name}_{CODE_TO_CLASS[pred_code]}"] = float(cm[code, pred_code])
+    return metrics
+
+
 def evaluate_fold(y_true: pd.Series, scores: np.ndarray) -> dict[str, float]:
-    predictions = (scores >= 0.5).astype(int)
-    tn, fp, fn, tp = confusion_matrix(y_true, predictions, labels=[0, 1]).ravel()
+    predictions = scores.argmax(axis=1)
+    metrics = evaluate_predictions(y_true, predictions)
+
     unique_classes = pd.Series(y_true).nunique()
     roc_auc = float("nan")
     pr_auc = float("nan")
@@ -254,102 +280,61 @@ def evaluate_fold(y_true: pd.Series, scores: np.ndarray) -> dict[str, float]:
     if unique_classes < 2:
         log.warning("Fold contains a single class; roc_auc and pr_auc are undefined for this split.")
     else:
-        roc_auc = roc_auc_score(y_true, scores)
-        pr_auc = average_precision_score(y_true, scores)
+        roc_auc = roc_auc_score(y_true, scores, multi_class="ovr", average="macro", labels=LABELS)
+        y_true_bin = label_binarize(y_true, classes=LABELS)
+        pr_auc = average_precision_score(y_true_bin, scores, average="macro")
 
-    return {
-        "roc_auc": roc_auc,
-        "pr_auc": pr_auc,
-        "precision": precision_score(y_true, predictions, zero_division=0),
-        "recall": recall_score(y_true, predictions, zero_division=0),
-        "f1": f1_score(y_true, predictions, zero_division=0),
-        "tp": float(tp),
-        "fp": float(fp),
-        "tn": float(tn),
-        "fn": float(fn),
-    }
-
-
-def evaluate_predictions(y_true: pd.Series, predictions: np.ndarray) -> dict[str, float]:
-    tn, fp, fn, tp = confusion_matrix(y_true, predictions, labels=[0, 1]).ravel()
-    return {
-        "precision": precision_score(y_true, predictions, zero_division=0),
-        "recall": recall_score(y_true, predictions, zero_division=0),
-        "f1": f1_score(y_true, predictions, zero_division=0),
-        "tp": float(tp),
-        "fp": float(fp),
-        "tn": float(tn),
-        "fn": float(fn),
-    }
+    metrics["roc_auc"] = roc_auc
+    metrics["pr_auc"] = pr_auc
+    return metrics
 
 
 def evaluate_by_caller(
-    callers: pd.Series, y_true: pd.Series, scores: np.ndarray, threshold: float = 0.5
+    callers: pd.Series, y_true: pd.Series, scores: np.ndarray
 ) -> pd.DataFrame:
     rows = []
     for caller in sorted(callers.astype(str).unique()):
-        mask = callers == caller
+        mask = (callers == caller).to_numpy()
         caller_y = y_true.loc[mask]
-        caller_scores = scores[mask.to_numpy()]
+        caller_predictions = scores[mask].argmax(axis=1)
 
-        baseline_predictions = np.ones(len(caller_y), dtype=int)
-        model_predictions = (caller_scores >= threshold).astype(int)
-
-        baseline = evaluate_predictions(caller_y, baseline_predictions)
-        model = evaluate_predictions(caller_y, model_predictions)
-
-        rows.append(
-            {
-                "caller": caller,
-                "records": float(len(caller_y)),
-                "baseline_precision": baseline["precision"],
-                "baseline_recall": baseline["recall"],
-                "baseline_f1": baseline["f1"],
-                "baseline_fp": baseline["fp"],
-                "baseline_tp": baseline["tp"],
-                "model_precision": model["precision"],
-                "model_recall": model["recall"],
-                "model_f1": model["f1"],
-                "model_fp": model["fp"],
-                "model_tp": model["tp"],
-                "fp_reduction": baseline["fp"] - model["fp"],
-                "tp_loss": baseline["tp"] - model["tp"],
-                "tp_retention_pct": (model["tp"] / baseline["tp"] * 100.0) if baseline["tp"] else 0.0,
-                "fp_reduction_pct": (baseline["fp"] - model["fp"]) / baseline["fp"] * 100.0 if baseline["fp"] else 0.0,
-            }
-        )
+        metrics = evaluate_predictions(caller_y, caller_predictions)
+        metrics["caller"] = caller
+        metrics["records"] = float(mask.sum())
+        rows.append(metrics)
 
     return pd.DataFrame(rows)
 
 
 def print_caller_report(report: pd.DataFrame) -> None:
-    print("\nPer-caller held-out metrics:")
+    print("\nPer-caller held-out metrics (3-class TP/FP/FN):")
     for row in report.sort_values("caller").itertuples(index=False):
+        print(f"\n{row.caller} records={int(row.records):,}")
+        for name in CLASS_LABELS:
+            print(
+                f"  {name}: "
+                f"precision={getattr(row, f'precision_{name}'):.4f} "
+                f"recall={getattr(row, f'recall_{name}'):.4f} "
+                f"f1={getattr(row, f'f1_{name}'):.4f} "
+                f"support={int(getattr(row, f'support_{name}')):,}"
+            )
         print(
-            f"{row.caller} "
-            f"records={int(row.records):,} "
-            f"baseline_precision={row.baseline_precision:.4f} "
-            f"model_precision={row.model_precision:.4f} "
-            f"baseline_recall={row.baseline_recall:.4f} "
-            f"model_recall={row.model_recall:.4f} "
-            f"baseline_f1={row.baseline_f1:.4f} "
-            f"model_f1={row.model_f1:.4f} "
-            f"fp_reduction={int(row.fp_reduction):,} "
-            f"fp_reduction_pct={row.fp_reduction_pct:.2f}% "
-            f"tp_loss={int(row.tp_loss):,} "
-            f"tp_retention_pct={row.tp_retention_pct:.2f}%"
+            f"  macro: "
+            f"precision={row.precision_macro:.4f} "
+            f"recall={row.recall_macro:.4f} "
+            f"f1={row.f1_macro:.4f}"
         )
 
 
 def plot_confusion_matrix_by_caller(
-    callers: pd.Series, y_true: pd.Series, scores: np.ndarray, path: str, threshold: float = 0.5
+    callers: pd.Series, y_true: pd.Series, scores: np.ndarray, path: str
 ) -> None:
     output_path = Path(path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    predictions = (scores >= threshold).astype(int)
-    class_order = sorted(CLASS_ALIASES, reverse=True)  # [1, 0] -> A, B
-    class_display = [CLASS_ALIASES[c] for c in class_order]
+    predictions = scores.argmax(axis=1)
+    class_order = LABELS
+    class_display = CLASS_LABELS
 
     caller_list = sorted(callers.astype(str).unique())
     ncols = min(len(caller_list), 3)
@@ -380,7 +365,7 @@ def plot_confusion_matrix_by_caller(
     for idx in range(len(caller_list), nrows * ncols):
         axes[idx // ncols][idx % ncols].axis("off")
 
-    fig.suptitle("Per-caller confusion matrix (A=TP, B=FP)")
+    fig.suptitle("Per-caller confusion matrix (TP/FP/FN)")
     fig.tight_layout()
     fig.savefig(output_path, dpi=120, bbox_inches="tight")
     plt.close(fig)
@@ -432,7 +417,7 @@ def run_cross_validation(
     print(f"Records: {len(X):,}")
     print(f"Features: {len(categorical_features) + len(numeric_features):,}")
     print(f"Unique mutation groups: {groups.nunique():,} ({groups.nunique() / len(X):.1%} of records)")
-    print(f"Positive label rate: {y.mean():.4f}")
+    print(f"Class rates: {y.value_counts(normalize=True).rename(index=CODE_TO_CLASS).round(4).to_dict()}")
     print(f"Groups for CV: {groups.nunique():,}")
     print()
 
@@ -458,7 +443,6 @@ def run_cross_validation(
         y_fold_val = y_train.loc[val_mask]
 
         pipeline = make_pipeline(
-            y_train=y_fold_train,
             numeric_features=numeric_features,
             categorical_features=categorical_features,
             random_state=random_state + fold,
@@ -470,9 +454,16 @@ def run_cross_validation(
         X_train_t = pre.fit_transform(X_fold_train)
         X_val_t = pre.transform(X_fold_val)
         X_test_t = pre.transform(X_test)
-        model.fit(X_train_t, y_fold_train, eval_set=[(X_val_t, y_fold_val)], verbose=False)
-        logloss_curves.append(model.evals_result()["validation_0"]["logloss"])
-        scores = model.predict_proba(X_test_t)[:, 1]
+        sample_weight = compute_sample_weight("balanced", y_fold_train)
+        model.fit(
+            X_train_t,
+            y_fold_train,
+            sample_weight=sample_weight,
+            eval_set=[(X_val_t, y_fold_val)],
+            verbose=False,
+        )
+        logloss_curves.append(model.evals_result()["validation_0"]["mlogloss"])
+        scores = model.predict_proba(X_test_t)
 
         fold_metrics = evaluate_fold(y_test, scores)
         fold_metrics["fold"] = float(fold)
@@ -482,9 +473,9 @@ def run_cross_validation(
             f"fold={fold} "
             f"roc_auc={fold_metrics['roc_auc']:.4f} "
             f"pr_auc={fold_metrics['pr_auc']:.4f} "
-            f"precision={fold_metrics['precision']:.4f} "
-            f"recall={fold_metrics['recall']:.4f} "
-            f"f1={fold_metrics['f1']:.4f}"
+            f"precision_macro={fold_metrics['precision_macro']:.4f} "
+            f"recall_macro={fold_metrics['recall_macro']:.4f} "
+            f"f1_macro={fold_metrics['f1_macro']:.4f}"
         )
 
     plot_logloss(
@@ -552,7 +543,6 @@ def run_single_split(
     )
 
     pipeline = make_pipeline(
-        y_train=y_train,
         numeric_features=numeric_features,
         categorical_features=categorical_features,
         random_state=random_state + 1,
@@ -564,14 +554,21 @@ def run_single_split(
     X_train_t = pre.fit_transform(X_train)
     X_val_t = pre.transform(X_val)
     X_test_t = pre.transform(X_test)
-    model.fit(X_train_t, y_train, eval_set=[(X_train_t, y_train), (X_val_t, y_val)], verbose=False)
+    sample_weight = compute_sample_weight("balanced", y_train)
+    model.fit(
+        X_train_t,
+        y_train,
+        sample_weight=sample_weight,
+        eval_set=[(X_train_t, y_train), (X_val_t, y_val)],
+        verbose=False,
+    )
     result = model.evals_result()
     plot_logloss(
-        [result["validation_0"]["logloss"], result["validation_1"]["logloss"]],
+        [result["validation_0"]["mlogloss"], result["validation_1"]["mlogloss"]],
         ["train", "val"],
         "figures/logloss_single.png",
     )
-    scores = model.predict_proba(X_test_t)[:, 1]
+    scores = model.predict_proba(X_test_t)
     caller_report = evaluate_by_caller(X_test["Caller"], y_test, scores)
     plot_confusion_matrix_by_caller(
         X_test["Caller"], y_test, scores, "figures/confusion_matrix_by_caller.png"
@@ -581,8 +578,8 @@ def run_single_split(
 
 def main() -> None:
     args = parse_args()
-    log.info("Building emitted-record table (TP vs FP)...")
-    records = build_emitted_record_table(args.data_path, sample_rows=args.sample_rows)
+    log.info("Building record table (TP vs FP vs FN)...")
+    records = build_record_table(args.data_path, sample_rows=args.sample_rows)
     if args.sample_rows is None:
         log.info(f"Records: {len(records):,} (full dataset)")
     else:
@@ -603,9 +600,9 @@ def main() -> None:
             "single_split "
             f"roc_auc={metrics['roc_auc']:.4f} "
             f"pr_auc={metrics['pr_auc']:.4f} "
-            f"precision={metrics['precision']:.4f} "
-            f"recall={metrics['recall']:.4f} "
-            f"f1={metrics['f1']:.4f}"
+            f"precision_macro={metrics['precision_macro']:.4f} "
+            f"recall_macro={metrics['recall_macro']:.4f} "
+            f"f1_macro={metrics['f1_macro']:.4f}"
         )
         print_caller_report(caller_report)
         if args.save_model:
