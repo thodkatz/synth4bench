@@ -316,7 +316,7 @@ def print_caller_report(report: pd.DataFrame) -> None:
                 f"precision={getattr(row, f'precision_{name}'):.4f} "
                 f"recall={getattr(row, f'recall_{name}'):.4f} "
                 f"f1={getattr(row, f'f1_{name}'):.4f} "
-                f"support={int(getattr(row, f'support_{name}')):,}"
+                f"num_samples={int(getattr(row, f'support_{name}')):,}"
             )
         print(
             f"  macro: "
