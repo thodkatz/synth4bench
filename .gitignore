@@ -12,7 +12,8 @@ wheels/
 .codex
 .claude
 runs/
-figures
+figures/*
+!figures/confusion_matrix_by_caller.png
 saved_models
 
 docs
